@@ -61,6 +61,11 @@ LEAN_RATIO = 0.5     # 低于此 → 轻度低头
 DEEP_RATIO = 0.3     # 低于此 → 严重低头
 EMA_ALPHA = 0.5      # 时序平滑系数（新值权重）
 
+# 抗椅子误识别：BlazePose 在空椅子上会给虚假关键点（典型症状是 sh_w≈0 让头肩比爆炸到几百几千）
+MIN_HEAD_POINTS = 2              # 头部 5 点中至少 N 个可见才算人——椅子上不会有头
+MIN_SHOULDER_WIDTH_PX = 30       # 肩宽过窄即噪声
+RATIO_VALID_RANGE = (-2.0, 2.0)  # 头肩比物理合理区间，超出即丢弃
+
 LEAN_WINDOW = 6      # 60 秒（6 帧 × 10 秒）
 DEEP_WINDOW = 6      # 60 秒
 HIT_RATIO = 0.7
@@ -69,6 +74,12 @@ ABSENT_FRAMES_TO_LEAVE = 2     # 连续 ≥20 秒未检出 = 离座
 SITTING_LIMIT_SEC = 40 * 60
 ACTIVITY_RESET_SEC = 10 * 60   # 离座 ≥10 分钟重置久坐
 ALERT_COOLDOWN_SEC = 5 * 60
+
+# 离座自适应采样：长时间没人就拉长间隔，省 CPU 和摄像头闪灯
+ABSENT_MEDIUM_SEC = 5 * 60     # 离座 ≥5 分钟 → 间隔变 10 分钟
+ABSENT_LONG_SEC = 30 * 60      # 离座 ≥30 分钟 → 间隔变 30 分钟
+INTERVAL_MEDIUM = 10 * 60.0
+INTERVAL_LONG = 30 * 60.0
 
 # MediaPipe BlazePose 33 关键点索引
 NOSE = 0
@@ -89,27 +100,34 @@ def analyze_pose(kp_xy, kp_conf):
     if not (visible(L_SHOULDER) and visible(R_SHOULDER)):
         return {"has_person": False, "head_ratio": None}
 
-    l_sh, r_sh = kp_xy[L_SHOULDER], kp_xy[R_SHOULDER]
-    sh_mid_y = (l_sh[1] + r_sh[1]) / 2
-    sh_w = abs(l_sh[0] - r_sh[0]) or 1.0
+    # 头部至少 N 个点可见——空椅子上 BlazePose 也会给肩点，但给不出头
+    head_visible = [i for i in HEAD_POINTS if visible(i)]
+    if len(head_visible) < MIN_HEAD_POINTS:
+        return {"has_person": False, "head_ratio": None}
 
-    # 用所有可见头部点（鼻+双眼+双耳）的 y 取平均，比单点稳得多
-    head_ys = [kp_xy[i][1] for i in HEAD_POINTS if visible(i)]
-    if not head_ys:
-        return {"has_person": True, "head_ratio": None}
-    head_y = sum(head_ys) / len(head_ys)
+    l_sh, r_sh = kp_xy[L_SHOULDER], kp_xy[R_SHOULDER]
+    sh_w = abs(l_sh[0] - r_sh[0])
+    # 肩宽过窄说明检测失真（典型空椅子 sh_w≈0 会让 ratio 爆到几百几千）
+    if sh_w < MIN_SHOULDER_WIDTH_PX:
+        return {"has_person": False, "head_ratio": None}
+
+    sh_mid_y = (l_sh[1] + r_sh[1]) / 2
+    head_y = sum(kp_xy[i][1] for i in head_visible) / len(head_visible)
 
     # 头比肩高出多少倍肩宽。端正 ~0.7+，低头减小，趴桌为负
     ratio = (sh_mid_y - head_y) / sh_w
+    if not (RATIO_VALID_RANGE[0] <= ratio <= RATIO_VALID_RANGE[1]):
+        return {"has_person": False, "head_ratio": None}
     return {"has_person": True, "head_ratio": float(ratio)}
 
 
 # ---------- 状态机 ----------
-def new_state():
+def new_state(now=None):
+    now = now if now is not None else time.time()
     return {
         "sitting_start_ts": 0.0,
         "sitting_total_sec": 0.0,
-        "last_seen_ts": 0.0,
+        "last_seen_ts": now,  # 启动时给个非 0 值，避免 absent_sec 一上来就巨大、立刻跳进长间隔
         "absent_frames": 0,
         "leave_ts": 0.0,
         "is_present": False,
@@ -237,7 +255,11 @@ def main():
     landmarker = mp_vision.PoseLandmarker.create_from_options(options)
 
     state = new_state()
-    print(f"[posture-guard] 启动完成，每 {SAMPLE_INTERVAL:.0f}s 采样一次（按需开摄像头），Ctrl+C 退出")
+    print(
+        f"[posture-guard] 启动完成，在座/短暂离座每 {SAMPLE_INTERVAL:.0f}s 采样，"
+        f"离座 ≥{ABSENT_MEDIUM_SEC // 60} 分钟 → {INTERVAL_MEDIUM / 60:.0f} 分钟，"
+        f"≥{ABSENT_LONG_SEC // 60} 分钟 → {INTERVAL_LONG / 60:.0f} 分钟。Ctrl+C 退出"
+    )
 
     try:
         while True:
@@ -268,6 +290,14 @@ def main():
                 notify(title, msg)
                 print(f"[ALERT] {title}: {msg}")
 
+            absent_sec = now - state["last_seen_ts"]
+            if absent_sec >= ABSENT_LONG_SEC:
+                interval = INTERVAL_LONG
+            elif absent_sec >= ABSENT_MEDIUM_SEC:
+                interval = INTERVAL_MEDIUM
+            else:
+                interval = SAMPLE_INTERVAL
+
             tags = []
             if obs["has_person"]:
                 tags.append(f"在座 {int(state['sitting_total_sec'])}s")
@@ -280,11 +310,11 @@ def main():
                     elif ema < LEAN_RATIO:
                         tags.append("前倾")
             else:
-                tags.append("离座")
+                tags.append(f"离座 {int(absent_sec)}s 下次 {int(interval)}s")
             print(f"[{time.strftime('%H:%M:%S')}] {' '.join(tags)} | 推理 {infer_ms:.0f}ms")
 
             elapsed = time.time() - tick
-            time.sleep(max(0.0, SAMPLE_INTERVAL - elapsed))
+            time.sleep(max(0.0, interval - elapsed))
     except KeyboardInterrupt:
         print("\n[posture-guard] 已退出")
     finally:
