@@ -1,0 +1,31 @@
+pyproject.toml
+  d0961d9ddcc515f7 1-11
+.gitignore
+  d0961d9ddcc515f7 1-10
+README.md
+  d0961d9ddcc515f7 1-163
+main.py
+  d0961d9ddcc515f7 1-212
+.python-version
+  d0961d9ddcc515f7 1
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "02fc5ff939eee021fcdc20c0666f8c67c0ffd851",
+  "prompts": {
+    "d0961d9ddcc515f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b800fb64-bae5-4231-a0ff-91984a91d824",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Harry Liu",
+      "messages": [],
+      "total_additions": 504,
+      "total_deletions": 107,
+      "accepted_lines": 397,
+      "overriden_lines": 0
+    }
+  }
+}
