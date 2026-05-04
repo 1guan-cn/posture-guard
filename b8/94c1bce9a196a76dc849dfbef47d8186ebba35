@@ -1,0 +1,23 @@
+main.py
+  61e396ab44df790d 64-68,78-83,103-107,109-112,114-115,119-120,125-126,130,258-262,293-300,313,317
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "b894c1bce9a196a76dc849dfbef47d8186ebba35",
+  "prompts": {
+    "61e396ab44df790d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "39b3412c-247f-48bf-ab36-bfe781dcace4",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Harry Liu",
+      "messages": [],
+      "total_additions": 42,
+      "total_deletions": 12,
+      "accepted_lines": 42,
+      "overriden_lines": 0
+    }
+  }
+}
