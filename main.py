@@ -52,6 +52,9 @@ from mediapipe.tasks.python import vision as mp_vision
 
 # ---------- 配置 ----------
 SAMPLE_INTERVAL = 10.0
+# 长 interval 时把 sleep 拆短：防止 macOS 挂起长 sleep（休眠 / App Nap），并让进程周期性"心跳"。
+# 真正开摄像头 + 推理仍按 interval 走，所以省电效果不变。
+SLEEP_CHUNK = 60.0
 KP_CONF = 0.5      # 单点 visibility "可见"阈值（用于头部均值参与判定）
 ANCHOR_CONF = 0.7  # 关键 anchor 点（双肩、头部至少 1 个）"高置信度"阈值，挡幻觉人
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
@@ -270,6 +273,8 @@ def main():
             tick = time.time()
             frame = grab_frame()
             if frame is None:
+                # 摄像头被其他进程占用（Zoom/腾讯会议等）时的静默期，必须打日志，否则用户看不出区别于"卡死"
+                print(f"[{time.strftime('%H:%M:%S')}] 摄像头不可用，{int(SAMPLE_INTERVAL)}s 后重试")
                 time.sleep(SAMPLE_INTERVAL)
                 continue
 
@@ -317,8 +322,13 @@ def main():
                 tags.append(f"离座 {int(absent_sec)}s 下次 {int(interval)}s")
             print(f"[{time.strftime('%H:%M:%S')}] {' '.join(tags)} | 推理 {infer_ms:.0f}ms")
 
-            elapsed = time.time() - tick
-            time.sleep(max(0.0, interval - elapsed))
+            # 拆短 sleep：长 sleep 在 macOS 上会被休眠/挂起冻结，醒来后要等剩余时间走完，导致采样"卡死"
+            deadline = tick + interval
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                time.sleep(min(SLEEP_CHUNK, remaining))
     except KeyboardInterrupt:
         print("\n[posture-guard] 已退出")
     finally:
