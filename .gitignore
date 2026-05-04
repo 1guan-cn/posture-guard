@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Model weights (auto-downloaded on first run)
+*.task
+*.pt

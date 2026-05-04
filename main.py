@@ -1,37 +1,80 @@
-"""posture-guard: 摄像头颈椎前倾监测，每 3 秒采样一次。"""
+"""posture-guard: 摄像头颈椎前倾监测。"""
+
+import os
+import threading
+
+
+def _silence_mediapipe_logs():
+    """MediaPipe C++ 层直接写 fd 2，Python 层环境变量（GLOG_minloglevel）管不住。
+    用 fd 重定向 + 后台线程过滤的方式拦截噪音日志（含 Google clearcut 遥测尝试上传的 ERROR）。"""
+    noise = (
+        "clearcut",
+        "Source Location Trace",
+        "wireless/android",
+        "inference_feedback_manager",
+        "init-domain",
+        "gl_context.cc",
+        "TensorFlow Lite XNNPACK",
+        "landmark_projection_calculator",
+    )
+    saved_fd = os.dup(2)
+    r, w = os.pipe()
+    os.dup2(w, 2)
+    os.close(w)
+
+    def pump():
+        buf = b""
+        while True:
+            chunk = os.read(r, 4096)
+            if not chunk:
+                break
+            buf += chunk
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
+                if not any(p in line.decode("utf-8", "replace") for p in noise):
+                    os.write(saved_fd, line + b"\n")
+
+    threading.Thread(target=pump, daemon=True).start()
+
+
+_silence_mediapipe_logs()
 
 import subprocess
 import time
+import urllib.request
 from collections import deque
 
 import cv2
+import mediapipe as mp
 import numpy as np
-from ultralytics import YOLO
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 # ---------- 配置 ----------
-SAMPLE_INTERVAL = 3.0
-MODEL_PATH = "yolov8n-pose.pt"
+SAMPLE_INTERVAL = 10.0
 KP_CONF = 0.5
+POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+POSE_MODEL_PATH = "pose_landmarker_lite.task"
 
 # 头肩高度比阈值：(肩 y - 头 y) / 肩宽。端正 ~0.7+，低头时减小
 LEAN_RATIO = 0.5     # 低于此 → 轻度低头
 DEEP_RATIO = 0.3     # 低于此 → 严重低头
-EMA_ALPHA = 0.4      # 时序平滑系数（新值权重）
+EMA_ALPHA = 0.5      # 时序平滑系数（新值权重）
 
-LEAN_WINDOW = 20     # 60 秒（20 帧 × 3 秒）
-DEEP_WINDOW = 10     # 30 秒
+LEAN_WINDOW = 6      # 60 秒（6 帧 × 10 秒）
+DEEP_WINDOW = 6      # 60 秒
 HIT_RATIO = 0.7
 
-ABSENT_FRAMES_TO_LEAVE = 2     # 连续 ≥6 秒未检出 = 离座
+ABSENT_FRAMES_TO_LEAVE = 2     # 连续 ≥20 秒未检出 = 离座
 SITTING_LIMIT_SEC = 40 * 60
 ACTIVITY_RESET_SEC = 10 * 60   # 离座 ≥10 分钟重置久坐
 ALERT_COOLDOWN_SEC = 5 * 60
 
-# COCO 17 关键点索引
+# MediaPipe BlazePose 33 关键点索引
 NOSE = 0
-L_EYE, R_EYE = 1, 2
-L_EAR, R_EAR = 3, 4
-L_SHOULDER, R_SHOULDER = 5, 6
+L_EYE, R_EYE = 2, 5
+L_EAR, R_EAR = 7, 8
+L_SHOULDER, R_SHOULDER = 11, 12
 HEAD_POINTS = (NOSE, L_EYE, R_EYE, L_EAR, R_EAR)
 
 
@@ -113,12 +156,15 @@ def update_state(s, obs, now):
         if s["sitting_total_sec"] >= SITTING_LIMIT_SEC and can_alert("sit"):
             alerts.append("sit")
             s["last_alert_ts"]["sit"] = now
-        # 重度优先于轻度
+        # 重度优先：触发 deep 时同时 mute lean，避免低头看手机时收到两条提醒
+        deep_fired = False
         if len(s["deep_window"]) >= DEEP_WINDOW:
             if sum(s["deep_window"]) / DEEP_WINDOW > HIT_RATIO and can_alert("deep"):
                 alerts.append("deep")
                 s["last_alert_ts"]["deep"] = now
-        if len(s["lean_window"]) >= LEAN_WINDOW:
+                s["last_alert_ts"]["lean"] = now
+                deep_fired = True
+        if not deep_fired and len(s["lean_window"]) >= LEAN_WINDOW:
             if sum(s["lean_window"]) / LEAN_WINDOW > HIT_RATIO and can_alert("lean"):
                 alerts.append("lean")
                 s["last_alert_ts"]["lean"] = now
@@ -137,46 +183,83 @@ ALERT_MSG = {
 def notify(title, msg):
     safe_title = title.replace('"', '\\"')
     safe_msg = msg.replace('"', '\\"')
-    # 异步播 Hero 音 + 异步弹常驻对话框（10 分钟没操作自动关闭，防止挂死）
-    subprocess.Popen(["afplay", "/System/Library/Sounds/Hero.aiff"])
+    # 异步播 Hero 音 + 异步弹常驻对话框（10 分钟没操作自动关闭，防止挂死）。
+    # stdout/stderr 重定向到 DEVNULL：避免 dialog 回执（"button returned:知道了"）污染主日志
+    subprocess.Popen(
+        ["afplay", "/System/Library/Sounds/Hero.aiff"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     script = (
         f'display dialog "{safe_msg}" with title "{safe_title}" '
         f'buttons {{"知道了"}} default button "知道了" '
         f'with icon caution giving up after 600'
     )
-    subprocess.Popen(["osascript", "-e", script])
+    subprocess.Popen(
+        ["osascript", "-e", script],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
 
 
 # ---------- 主循环 ----------
-def main():
-    print(f"[posture-guard] 加载模型 {MODEL_PATH}…")
-    model = YOLO(MODEL_PATH)
+def ensure_model():
+    if not os.path.exists(POSE_MODEL_PATH):
+        print(f"[posture-guard] 下载 MediaPipe Pose 模型 (~6 MB)…")
+        urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
+
+
+def grab_frame():
+    """按需开关摄像头：sleep 期间释放设备，避免 OpenCV 后台管线吃 CPU。代价：摄像头指示灯每次采样会闪一下。"""
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
-        raise RuntimeError("无法打开摄像头（系统设置 → 隐私与安全性 → 摄像头 中授予终端权限）")
+        return None
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # 摄像头需要预热几帧才能得到稳定曝光帧
+    for _ in range(3):
+        cap.read()
+    ok, frame = cap.read()
+    cap.release()
+    return frame if ok else None
+
+
+def main():
+    ensure_model()
+    print("[posture-guard] 加载 MediaPipe Pose (lite)…")
+    options = mp_vision.PoseLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        min_pose_detection_confidence=KP_CONF,
+        min_pose_presence_confidence=KP_CONF,
+        min_tracking_confidence=KP_CONF,
+    )
+    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
 
     state = new_state()
-    print(f"[posture-guard] 启动完成，每 {SAMPLE_INTERVAL}s 采样一次，Ctrl+C 退出")
+    print(f"[posture-guard] 启动完成，每 {SAMPLE_INTERVAL:.0f}s 采样一次（按需开摄像头），Ctrl+C 退出")
 
     try:
         while True:
             tick = time.time()
-            ok, frame = cap.read()
-            if not ok:
+            frame = grab_frame()
+            if frame is None:
                 time.sleep(SAMPLE_INTERVAL)
                 continue
 
-            results = model(frame, verbose=False)
+            infer_start = time.time()
+            # MediaPipe 要 RGB；归一化坐标乘回像素，让 x/y 单位一致
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts_ms = int(time.time() * 1000)
+            result = landmarker.detect_for_video(mp_image, ts_ms)
+            infer_ms = (time.time() - infer_start) * 1000
             kp_xy, kp_conf = None, None
-            if results and results[0].keypoints is not None:
-                kps = results[0].keypoints
-                if kps.xy is not None and len(kps.xy) > 0:
-                    kp_xy = kps.xy[0].cpu().numpy()
-                    kp_conf = (
-                        kps.conf[0].cpu().numpy()
-                        if kps.conf is not None
-                        else np.ones(len(kp_xy))
-                    )
+            if result.pose_landmarks:
+                h, w = frame.shape[:2]
+                lms = result.pose_landmarks[0]
+                kp_xy = np.array([(lm.x * w, lm.y * h) for lm in lms])
+                kp_conf = np.array([lm.visibility for lm in lms])
 
             obs = analyze_pose(kp_xy, kp_conf)
             now = time.time()
@@ -198,14 +281,14 @@ def main():
                         tags.append("前倾")
             else:
                 tags.append("离座")
-            print(f"[{time.strftime('%H:%M:%S')}] {' '.join(tags)}")
+            print(f"[{time.strftime('%H:%M:%S')}] {' '.join(tags)} | 推理 {infer_ms:.0f}ms")
 
             elapsed = time.time() - tick
             time.sleep(max(0.0, SAMPLE_INTERVAL - elapsed))
     except KeyboardInterrupt:
         print("\n[posture-guard] 已退出")
     finally:
-        cap.release()
+        landmarker.close()
 
 
 if __name__ == "__main__":
