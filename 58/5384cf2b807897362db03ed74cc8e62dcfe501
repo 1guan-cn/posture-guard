@@ -1,0 +1,23 @@
+README.md
+  d0961d9ddcc515f7 96-118
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.4",
+  "base_commit_sha": "585384cf2b807897362db03ed74cc8e62dcfe501",
+  "prompts": {
+    "d0961d9ddcc515f7": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b800fb64-bae5-4231-a0ff-91984a91d824",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Harry Liu",
+      "messages": [],
+      "total_additions": 23,
+      "total_deletions": 0,
+      "accepted_lines": 23,
+      "overriden_lines": 0
+    }
+  }
+}
