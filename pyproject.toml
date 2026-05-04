@@ -1,0 +1,11 @@
+[project]
+name = "posture-guard"
+version = "0.1.0"
+description = "本地摄像头颈椎前倾与久坐监测，纯几何判定，无云端依赖。"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numpy>=2.4.4",
+    "opencv-python>=4.13.0.92",
+    "ultralytics>=8.4.46",
+]
