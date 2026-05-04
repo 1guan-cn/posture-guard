@@ -59,6 +59,7 @@ KP_CONF = 0.5      # 单点 visibility "可见"阈值（用于头部均值参与
 ANCHOR_CONF = 0.7  # 关键 anchor 点（双肩、头部至少 1 个）"高置信度"阈值，挡幻觉人
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 POSE_MODEL_PATH = "pose_landmarker_lite.task"
+ALERT_SOUND_PATH = "alert.wav"  # 项目根目录的本地音效
 
 # 头肩高度比阈值：(肩 y - 头 y) / 肩宽。端正 ~0.7+，低头时减小
 LEAN_RATIO = 0.5     # 低于此 → 轻度低头
@@ -207,13 +208,16 @@ ALERT_MSG = {
 def notify(title, msg):
     safe_title = title.replace('"', '\\"')
     safe_msg = msg.replace('"', '\\"')
-    # 异步播 Hero 音 + 异步弹常驻对话框（10 分钟没操作自动关闭，防止挂死）。
+    # 异步播本地音效 + 异步弹常驻对话框（10 分钟没操作自动关闭，防止挂死）。
     # stdout/stderr 重定向到 DEVNULL：避免 dialog 回执（"button returned:知道了"）污染主日志
-    subprocess.Popen(
-        ["afplay", "/System/Library/Sounds/Hero.aiff"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    if os.path.exists(ALERT_SOUND_PATH):
+        subprocess.Popen(
+            ["afplay", ALERT_SOUND_PATH],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        print(f"[posture-guard] 警告: 音效文件 {ALERT_SOUND_PATH} 不存在，跳过播放")
     script = (
         f'display dialog "{safe_msg}" with title "{safe_title}" '
         f'buttons {{"知道了"}} default button "知道了" '
