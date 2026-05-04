@@ -52,7 +52,8 @@ from mediapipe.tasks.python import vision as mp_vision
 
 # ---------- 配置 ----------
 SAMPLE_INTERVAL = 10.0
-KP_CONF = 0.5
+KP_CONF = 0.5      # 单点 visibility "可见"阈值（用于头部均值参与判定）
+ANCHOR_CONF = 0.7  # 关键 anchor 点（双肩、头部至少 1 个）"高置信度"阈值，挡幻觉人
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 POSE_MODEL_PATH = "pose_landmarker_lite.task"
 
@@ -96,13 +97,15 @@ def analyze_pose(kp_xy, kp_conf):
 
     visible = lambda i: kp_conf[i] >= KP_CONF
 
-    # 双肩是几何判定的最低要求
-    if not (visible(L_SHOULDER) and visible(R_SHOULDER)):
+    # 双肩必须高置信度——挡 BlazePose 在空画面时"幻觉"出形态合理的虚假人
+    if min(kp_conf[L_SHOULDER], kp_conf[R_SHOULDER]) < ANCHOR_CONF:
         return {"has_person": False, "head_ratio": None}
 
-    # 头部至少 N 个点可见——空椅子上 BlazePose 也会给肩点，但给不出头
+    # 头部至少 N 个点可见，且至少 1 个高置信度——椅子/背景上没头
     head_visible = [i for i in HEAD_POINTS if visible(i)]
     if len(head_visible) < MIN_HEAD_POINTS:
+        return {"has_person": False, "head_ratio": None}
+    if max(kp_conf[i] for i in head_visible) < ANCHOR_CONF:
         return {"has_person": False, "head_ratio": None}
 
     l_sh, r_sh = kp_xy[L_SHOULDER], kp_xy[R_SHOULDER]
@@ -248,9 +251,10 @@ def main():
     options = mp_vision.PoseLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH),
         running_mode=mp_vision.RunningMode.VIDEO,
-        min_pose_detection_confidence=KP_CONF,
-        min_pose_presence_confidence=KP_CONF,
-        min_tracking_confidence=KP_CONF,
+        # 三个阈值用 ANCHOR_CONF：MP 内部检测/存在/跟踪环节就先过滤掉低置信度的虚假姿态
+        min_pose_detection_confidence=ANCHOR_CONF,
+        min_pose_presence_confidence=ANCHOR_CONF,
+        min_tracking_confidence=ANCHOR_CONF,
     )
     landmarker = mp_vision.PoseLandmarker.create_from_options(options)
 
