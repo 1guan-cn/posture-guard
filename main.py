@@ -55,6 +55,10 @@ SAMPLE_INTERVAL = 10.0
 # 长 interval 时把 sleep 拆短：防止 macOS 挂起长 sleep（休眠 / App Nap），并让进程周期性"心跳"。
 # 真正开摄像头 + 推理仍按 interval 走，所以省电效果不变。
 SLEEP_CHUNK = 60.0
+# 离座长间隔下，每 IDLE_POLL_CHUNK 秒查一次键鼠 idle。
+# 判定：idle 比这一段 sleep 实际时长还短 → sleep 期间 idle 被重置过 → 必定发生过键鼠活动。
+# 不能用固定阈值（如 idle<5s），那只能捕获"查询瞬间正好在动"，会漏掉 sleep 中段动一下的场景。
+IDLE_POLL_CHUNK = 30.0
 KP_CONF = 0.5      # 单点 visibility "可见"阈值（用于头部均值参与判定）
 ANCHOR_CONF = 0.7  # 关键 anchor 点（双肩、头部至少 1 个）"高置信度"阈值，挡幻觉人
 POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
@@ -237,6 +241,25 @@ def ensure_model():
         urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
 
 
+def hid_idle_sec():
+    """读 macOS IOHIDSystem 的键鼠 idle 秒数（触控板/鼠标/键盘共用同一计数器）。读取失败返回 None。"""
+    try:
+        out = subprocess.check_output(
+            ["ioreg", "-c", "IOHIDSystem"],
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        ).decode("utf-8", "replace")
+    except Exception:
+        return None
+    for line in out.splitlines():
+        if "HIDIdleTime" in line:
+            try:
+                return int(line.rsplit("=", 1)[1].strip()) / 1e9
+            except ValueError:
+                return None
+    return None
+
+
 def grab_frame():
     """按需开关摄像头：sleep 期间释放设备，避免 OpenCV 后台管线吃 CPU。代价：摄像头指示灯每次采样会闪一下。"""
     cap = cv2.VideoCapture(0)
@@ -327,12 +350,22 @@ def main():
             print(f"[{time.strftime('%H:%M:%S')}] {' '.join(tags)} | 推理 {infer_ms:.0f}ms")
 
             # 拆短 sleep：长 sleep 在 macOS 上会被休眠/挂起冻结，醒来后要等剩余时间走完，导致采样"卡死"
+            # 离座长间隔时改用 IDLE_POLL_CHUNK 步长，每步查一次键鼠 idle → 用户回来动鼠标键盘可被快速捕获
             deadline = tick + interval
+            use_hid_wake = interval > SAMPLE_INTERVAL
+            chunk = IDLE_POLL_CHUNK if use_hid_wake else SLEEP_CHUNK
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
                     break
-                time.sleep(min(SLEEP_CHUNK, remaining))
+                sleep_dur = min(chunk, remaining)
+                time.sleep(sleep_dur)
+                if use_hid_wake:
+                    idle = hid_idle_sec()
+                    # +1s 容差：ioreg 调用本身和 sleep 唤醒抖动各占几十~几百毫秒
+                    if idle is not None and idle < sleep_dur + 1.0:
+                        print(f"[{time.strftime('%H:%M:%S')}] 检测到键鼠活动 (idle {idle:.1f}s, sleep {sleep_dur:.0f}s)，提前重采样")
+                        break
     except KeyboardInterrupt:
         print("\n[posture-guard] 已退出")
     finally:
