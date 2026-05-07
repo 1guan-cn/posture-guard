@@ -1,0 +1,22 @@
+README.md
+  s_5f9d264f349289::t_973da39b3e5da7 25,27-29
+main.py
+  s_5f9d264f349289::t_5654ed4cdd6261 35-39
+  s_5f9d264f349289::t_89402719973f86 118-121,127,129,133,138,146
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "1bb13429a8b6aac55593ecdda11d2b224e1c440a",
+  "prompts": {},
+  "sessions": {
+    "s_5f9d264f349289": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7fcaccc9-5ea4-4b54-b86e-6bd19767257c",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Harry Liu <747311978@qq.com>"
+    }
+  }
+}
