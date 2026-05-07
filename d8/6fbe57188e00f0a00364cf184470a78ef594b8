@@ -1,0 +1,47 @@
+.gitignore
+  s_5f9d264f349289::t_2ab880fc85608f 12,15
+main.py
+  ade9bc62f1c0d836 72-73,75-82,112-113,314-317,323-335,346-351,361-368
+  s_5f9d264f349289::t_abd9f770924137 5,11,19-28,35-36,38,55,57-59,63-64,69-71,74,83-111,115-117,120,122,129,135,282-289,309,311-312
+  s_5f9d264f349289::t_a6c2c1753badf0 66-68
+README.md
+  s_5f9d264f349289::t_883962512c38d1 17
+  s_5f9d264f349289::t_32b9c329be31a8 103,106,108-109
+  s_5f9d264f349289::t_60eb6f1d989112 11
+  s_5f9d264f349289::t_a3ad136635036f 197
+  s_5f9d264f349289::t_ab76f36564f621 23-25,28,33
+  s_5f9d264f349289::t_1d728d0ef18c53 227
+  s_5f9d264f349289::t_b1c14b571c4a4c 99-102,104-105,107,110-111
+  s_5f9d264f349289::t_9596bd8756e4da 5
+pyproject.toml
+  s_5f9d264f349289::t_3439378e931ceb 11
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.4.1",
+  "base_commit_sha": "d86fbe57188e00f0a00364cf184470a78ef594b8",
+  "prompts": {
+    "ade9bc62f1c0d836": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "402a9112-a714-4616-85cf-5dd15c5f1581",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "Harry Liu <747311978@qq.com>",
+      "total_additions": 49,
+      "total_deletions": 7,
+      "accepted_lines": 43,
+      "overriden_lines": 0
+    }
+  },
+  "sessions": {
+    "s_5f9d264f349289": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "7fcaccc9-5ea4-4b54-b86e-6bd19767257c",
+        "model": "unknown"
+      },
+      "human_author": "Harry Liu <747311978@qq.com>"
+    }
+  }
+}
