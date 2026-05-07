@@ -1,79 +1,41 @@
 """posture-guard: 摄像头颈椎前倾监测。"""
 
 import os
-import threading
-
-
-def _silence_mediapipe_logs():
-    """MediaPipe C++ 层直接写 fd 2，Python 层环境变量（GLOG_minloglevel）管不住。
-    用 fd 重定向 + 后台线程过滤的方式拦截噪音日志（含 Google clearcut 遥测尝试上传的 ERROR）。"""
-    noise = (
-        "clearcut",
-        "Source Location Trace",
-        "wireless/android",
-        "inference_feedback_manager",
-        "init-domain",
-        "gl_context.cc",
-        "TensorFlow Lite XNNPACK",
-        "landmark_projection_calculator",
-    )
-    saved_fd = os.dup(2)
-    r, w = os.pipe()
-    os.dup2(w, 2)
-    os.close(w)
-
-    def pump():
-        buf = b""
-        while True:
-            chunk = os.read(r, 4096)
-            if not chunk:
-                break
-            buf += chunk
-            while b"\n" in buf:
-                line, buf = buf.split(b"\n", 1)
-                if not any(p in line.decode("utf-8", "replace") for p in noise):
-                    os.write(saved_fd, line + b"\n")
-
-    threading.Thread(target=pump, daemon=True).start()
-
-
-_silence_mediapipe_logs()
-
 import subprocess
+import sys
 import time
-import urllib.request
 from collections import deque
 
 import cv2
-import mediapipe as mp
 import numpy as np
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision as mp_vision
+import onnxruntime as ort
 
 # ---------- 配置 ----------
 SAMPLE_INTERVAL = 10.0
 # 长 interval 时把 sleep 拆短：防止 macOS 挂起长 sleep（休眠 / App Nap），并让进程周期性"心跳"。
-# 真正开摄像头 + 推理仍按 interval 走，所以省电效果不变。
 SLEEP_CHUNK = 60.0
 # 离座长间隔下，每 IDLE_POLL_CHUNK 秒查一次键鼠 idle。
-# 判定：idle 比这一段 sleep 实际时长还短 → sleep 期间 idle 被重置过 → 必定发生过键鼠活动。
-# 不能用固定阈值（如 idle<5s），那只能捕获"查询瞬间正好在动"，会漏掉 sleep 中段动一下的场景。
 IDLE_POLL_CHUNK = 30.0
-KP_CONF = 0.5      # 单点 visibility "可见"阈值（用于头部均值参与判定）
-ANCHOR_CONF = 0.7  # 关键 anchor 点（双肩、头部至少 1 个）"高置信度"阈值，挡幻觉人
-POSE_MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
-POSE_MODEL_PATH = "pose_landmarker_lite.task"
-ALERT_SOUND_PATH = "alert.wav"  # 项目根目录的本地音效
+
+# YOLO11n-pose 是真正的"先检测人 → 再标关键点"两阶段联合模型，没人时不输出 detection，
+# 从根上消除 BlazePose 系在空椅子上幻觉关键点的问题。模型经 ONNX 导出后用 onnxruntime 直推，
+# 完全不依赖 ultralytics/torch，运行时常驻内存约 100–200MB。
+MODEL_PATH = "yolo11n-pose.onnx"
+MODEL_INPUT_SIZE = 640
+PERSON_CONF = 0.5    # YOLO 人物 detection 置信度阈值
+KEYPOINT_CONF = 0.5  # 单关键点 visibility 阈值
+
+ALERT_SOUND_PATH = "alert.wav"
 
 # 头肩高度比阈值：(肩 y - 头 y) / 肩宽。端正 ~0.7+，低头时减小
 LEAN_RATIO = 0.5     # 低于此 → 轻度低头
 DEEP_RATIO = 0.3     # 低于此 → 严重低头
 EMA_ALPHA = 0.5      # 时序平滑系数（新值权重）
 
-# 抗椅子误识别：BlazePose 在空椅子上会给虚假关键点（典型症状是 sh_w≈0 让头肩比爆炸到几百几千）
-MIN_HEAD_POINTS = 2              # 头部 5 点中至少 N 个可见才算人——椅子上不会有头
+# YOLO 已根治幻觉，下面这些是次级保险（防偶发误检/截断画面）
+MIN_HEAD_POINTS = 2              # 头部 5 点中至少 N 个可见才算人
 MIN_SHOULDER_WIDTH_PX = 30       # 肩宽过窄即噪声
-RATIO_VALID_RANGE = (-2.0, 2.0)  # 头肩比物理合理区间，超出即丢弃
+RATIO_VALID_RANGE = (-2.0, 2.0)  # 头肩比物理合理区间
 
 LEAN_WINDOW = 6      # 60 秒（6 帧 × 10 秒）
 DEEP_WINDOW = 6      # 60 秒
@@ -90,40 +52,87 @@ ABSENT_LONG_SEC = 30 * 60      # 离座 ≥30 分钟 → 间隔变 30 分钟
 INTERVAL_MEDIUM = 10 * 60.0
 INTERVAL_LONG = 30 * 60.0
 
-# MediaPipe BlazePose 33 关键点索引
+# COCO 17 关键点索引（YOLO-pose 标准布局）
 NOSE = 0
-L_EYE, R_EYE = 2, 5
-L_EAR, R_EAR = 7, 8
-L_SHOULDER, R_SHOULDER = 11, 12
+L_EYE, R_EYE = 1, 2
+L_EAR, R_EAR = 3, 4
+L_SHOULDER, R_SHOULDER = 5, 6
 HEAD_POINTS = (NOSE, L_EYE, R_EYE, L_EAR, R_EAR)
 
 
+MODEL_EXPORT_HINT = """
+缺少模型文件 {path}。一次性导出（uvx 临时托管 ultralytics+torch，导出完即可弃用）：
+
+  uvx --with onnx --with onnxslim --from ultralytics yolo export model=yolo11n-pose.pt format=onnx imgsz={size}
+
+执行完会在当前目录生成 yolo11n-pose.onnx (~11 MB)。
+"""
+
+
+# ---------- 工具 ----------
+def fmt_dur(sec):
+    """中文人读时长。<60s 显示秒；<1h 分（带零头秒）；≥1h 时分。"""
+    sec = max(0, int(sec))
+    if sec < 60:
+        return f"{sec}秒"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}分{s:02d}秒" if s else f"{m}分钟"
+    h, m = divmod(m, 60)
+    return f"{h}时{m:02d}分" if m else f"{h}小时"
+
+
+# ---------- 模型推理 ----------
+def detect_keypoints(session, frame):
+    """跑 YOLO11n-pose，返回最高置信度人物的 17 关键点 (numpy [17, 3] = x_px, y_px, conf)。
+    画面无人时返回 None——这是 YOLO 相对 BlazePose 的本质改进：先做人物检测，没人就是没人。"""
+    h, w = frame.shape[:2]
+    # letterbox：等比缩放 + 右/下灰边 (114)，保持人体不被拉伸
+    scale = MODEL_INPUT_SIZE / max(h, w)
+    nh, nw = int(h * scale), int(w * scale)
+    resized = cv2.resize(frame, (nw, nh))
+    canvas = np.full((MODEL_INPUT_SIZE, MODEL_INPUT_SIZE, 3), 114, dtype=np.uint8)
+    canvas[:nh, :nw] = resized
+    rgb = cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB)
+    # HWC uint8 → NCHW float32 ∈ [0, 1]
+    tensor = (rgb.astype(np.float32) / 255.0).transpose(2, 0, 1)[None]
+
+    output = session.run(None, {session.get_inputs()[0].name: tensor})[0]
+    # 输出 shape (1, 56, num_anchors)。56 = 4 (cx,cy,w,h) + 1 (person_conf) + 17*3 (kp_x, kp_y, kp_conf)
+    pred = output[0].T  # → (num_anchors, 56)
+    conf = pred[:, 4]
+    if conf.max() < PERSON_CONF:
+        return None
+    best = pred[int(np.argmax(conf))]
+    kp = best[5:].reshape(17, 3).astype(np.float32).copy()
+    # 关键点从 letterbox 输入坐标系映回原图像素
+    kp[:, 0] /= scale
+    kp[:, 1] /= scale
+    return kp
+
+
 # ---------- 单帧分析 ----------
-def analyze_pose(kp_xy, kp_conf):
-    if kp_xy is None or len(kp_xy) == 0:
+def analyze_pose(kp):
+    """kp: (17, 3) numpy 数组 [x, y, conf]，None 表示无人。"""
+    if kp is None:
         return {"has_person": False, "head_ratio": None}
 
-    visible = lambda i: kp_conf[i] >= KP_CONF
+    visible = lambda i: kp[i, 2] >= KEYPOINT_CONF
 
-    # 双肩必须高置信度——挡 BlazePose 在空画面时"幻觉"出形态合理的虚假人
-    if min(kp_conf[L_SHOULDER], kp_conf[R_SHOULDER]) < ANCHOR_CONF:
+    if min(kp[L_SHOULDER, 2], kp[R_SHOULDER, 2]) < KEYPOINT_CONF:
         return {"has_person": False, "head_ratio": None}
 
-    # 头部至少 N 个点可见，且至少 1 个高置信度——椅子/背景上没头
     head_visible = [i for i in HEAD_POINTS if visible(i)]
     if len(head_visible) < MIN_HEAD_POINTS:
         return {"has_person": False, "head_ratio": None}
-    if max(kp_conf[i] for i in head_visible) < ANCHOR_CONF:
-        return {"has_person": False, "head_ratio": None}
 
-    l_sh, r_sh = kp_xy[L_SHOULDER], kp_xy[R_SHOULDER]
+    l_sh, r_sh = kp[L_SHOULDER, :2], kp[R_SHOULDER, :2]
     sh_w = abs(l_sh[0] - r_sh[0])
-    # 肩宽过窄说明检测失真（典型空椅子 sh_w≈0 会让 ratio 爆到几百几千）
     if sh_w < MIN_SHOULDER_WIDTH_PX:
         return {"has_person": False, "head_ratio": None}
 
     sh_mid_y = (l_sh[1] + r_sh[1]) / 2
-    head_y = sum(kp_xy[i][1] for i in head_visible) / len(head_visible)
+    head_y = sum(kp[i, 1] for i in head_visible) / len(head_visible)
 
     # 头比肩高出多少倍肩宽。端正 ~0.7+，低头减小，趴桌为负
     ratio = (sh_mid_y - head_y) / sh_w
@@ -235,12 +244,6 @@ def notify(title, msg):
 
 
 # ---------- 主循环 ----------
-def ensure_model():
-    if not os.path.exists(POSE_MODEL_PATH):
-        print(f"[posture-guard] 下载 MediaPipe Pose 模型 (~6 MB)…")
-        urllib.request.urlretrieve(POSE_MODEL_URL, POSE_MODEL_PATH)
-
-
 def hid_idle_sec():
     """读 macOS IOHIDSystem 的键鼠 idle 秒数（触控板/鼠标/键盘共用同一计数器）。读取失败返回 None。"""
     try:
@@ -276,17 +279,14 @@ def grab_frame():
 
 
 def main():
-    ensure_model()
-    print("[posture-guard] 加载 MediaPipe Pose (lite)…")
-    options = mp_vision.PoseLandmarkerOptions(
-        base_options=mp_python.BaseOptions(model_asset_path=POSE_MODEL_PATH),
-        running_mode=mp_vision.RunningMode.VIDEO,
-        # 三个阈值用 ANCHOR_CONF：MP 内部检测/存在/跟踪环节就先过滤掉低置信度的虚假姿态
-        min_pose_detection_confidence=ANCHOR_CONF,
-        min_pose_presence_confidence=ANCHOR_CONF,
-        min_tracking_confidence=ANCHOR_CONF,
-    )
-    landmarker = mp_vision.PoseLandmarker.create_from_options(options)
+    if not os.path.exists(MODEL_PATH):
+        print(MODEL_EXPORT_HINT.format(path=MODEL_PATH, size=MODEL_INPUT_SIZE))
+        sys.exit(1)
+
+    print(f"[posture-guard] 加载 {MODEL_PATH}…")
+    # macOS arm64 优先 CoreML EP（自动 fallback CPU），其余平台直接 CPU
+    providers = ["CoreMLExecutionProvider", "CPUExecutionProvider"] if sys.platform == "darwin" else ["CPUExecutionProvider"]
+    session = ort.InferenceSession(MODEL_PATH, providers=providers)
 
     state = new_state()
     print(
@@ -306,25 +306,32 @@ def main():
                 continue
 
             infer_start = time.time()
-            # MediaPipe 要 RGB；归一化坐标乘回像素，让 x/y 单位一致
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts_ms = int(time.time() * 1000)
-            result = landmarker.detect_for_video(mp_image, ts_ms)
+            kp = detect_keypoints(session, frame)
             infer_ms = (time.time() - infer_start) * 1000
-            kp_xy, kp_conf = None, None
-            if result.pose_landmarks:
-                h, w = frame.shape[:2]
-                lms = result.pose_landmarks[0]
-                kp_xy = np.array([(lm.x * w, lm.y * h) for lm in lms])
-                kp_conf = np.array([lm.visibility for lm in lms])
 
-            obs = analyze_pose(kp_xy, kp_conf)
+            obs = analyze_pose(kp)
             now = time.time()
+            # update_state 会清 leave_ts 并可能重置 sitting_total_sec，所以提前快照
+            was_present = state["is_present"]
+            prev_leave_ts = state["leave_ts"]
+            prev_total = state["sitting_total_sec"]
             for a in update_state(state, obs, now):
                 title, msg = ALERT_MSG[a]
                 notify(title, msg)
                 print(f"[ALERT] {title}: {msg}")
+
+            # 刚从离座切回在座：只在状态切换那一帧打一次回归提示，不刷屏
+            if not was_present and state["is_present"] and prev_leave_ts > 0:
+                rest_sec = now - prev_leave_ts
+                ts = time.strftime('%H:%M:%S')
+                if rest_sec >= ACTIVITY_RESET_SEC:
+                    print(f"[{ts}] 欢迎回来，休息了 {fmt_dur(rest_sec)}，坐姿计时已重置")
+                elif prev_total > 0:
+                    need = ACTIVITY_RESET_SEC - rest_sec
+                    print(
+                        f"[{ts}] 欢迎回来，休息 {fmt_dur(rest_sec)}（未满 {fmt_dur(ACTIVITY_RESET_SEC)}，"
+                        f"还差 {fmt_dur(need)}才会重置），坐姿计时延续 {fmt_dur(prev_total)}"
+                    )
 
             absent_sec = now - state["last_seen_ts"]
             if absent_sec >= ABSENT_LONG_SEC:
@@ -336,7 +343,12 @@ def main():
 
             tags = []
             if obs["has_person"]:
-                tags.append(f"在座 {int(state['sitting_total_sec'])}s")
+                sat = state["sitting_total_sec"]
+                remaining = SITTING_LIMIT_SEC - sat
+                if remaining > 0:
+                    tags.append(f"在座 {fmt_dur(sat)} (距提醒 {fmt_dur(remaining)})")
+                else:
+                    tags.append(f"在座 {fmt_dur(sat)} (已超 {fmt_dur(-remaining)})")
                 raw = obs["head_ratio"]
                 ema = state["ema_ratio"]
                 if raw is not None:
@@ -346,7 +358,14 @@ def main():
                     elif ema < LEAN_RATIO:
                         tags.append("前倾")
             else:
-                tags.append(f"离座 {int(absent_sec)}s 下次 {int(interval)}s")
+                # 离座中：之前若有累积坐姿，提示是否已休息够（≥10 分钟回来即重置）
+                rest_tag = f"离座 {fmt_dur(absent_sec)}"
+                if state["sitting_total_sec"] > 0:
+                    if absent_sec < ACTIVITY_RESET_SEC:
+                        rest_tag += f" (再休息 {fmt_dur(ACTIVITY_RESET_SEC - absent_sec)} 可重置坐姿 {fmt_dur(state['sitting_total_sec'])})"
+                    else:
+                        rest_tag += " (已休息够，回来重新计时)"
+                tags.append(f"{rest_tag} 下次 {fmt_dur(interval)}")
             print(f"[{time.strftime('%H:%M:%S')}] {' '.join(tags)} | 推理 {infer_ms:.0f}ms")
 
             # 拆短 sleep：长 sleep 在 macOS 上会被休眠/挂起冻结，醒来后要等剩余时间走完，导致采样"卡死"
@@ -368,8 +387,6 @@ def main():
                         break
     except KeyboardInterrupt:
         print("\n[posture-guard] 已退出")
-    finally:
-        landmarker.close()
 
 
 if __name__ == "__main__":

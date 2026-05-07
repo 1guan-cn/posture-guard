@@ -2,31 +2,35 @@
 
 > 本地摄像头颈椎前倾与久坐监测。每 10 秒一帧，纯几何判定，全程离线，不上传任何画面。
 
-久坐和低头是程序员的两大慢性损伤源。市面上的提醒类工具要么是计时器（不知道你是不是真的离座了），要么是依赖云端 AI（隐私堪忧）。这个项目用 [MediaPipe Pose](https://ai.google.dev/edge/mediapipe/solutions/vision/pose_landmarker)（5.5 MB 本地模型）+ 朴素几何判定，做到三件事：
+久坐和低头是程序员的两大慢性损伤源。市面上的提醒类工具要么是计时器（不知道你是不是真的离座了），要么是依赖云端 AI（隐私堪忧）。这个项目用 [YOLOv11-pose](https://docs.ultralytics.com/tasks/pose/)（导出为 ONNX，~11 MB 本地模型，由 onnxruntime 直推）+ 朴素几何判定，做到三件事：
 
 - 久坐 40 分钟提醒（**真离座**才重置计时，短暂走神不算）
 - 颈椎前倾 60 秒提醒
 - 严重低头 60 秒提醒
 
-模型完全本地推理，画面不落盘、不联网。在座时每 10 秒采样一帧，**采样时才打开摄像头**；长时间离座自动降频到 10 / 30 分钟一次。平时进程几乎不占 CPU；常驻内存 ~300 MB。
+模型完全本地推理，画面不落盘、不联网。在座时每 10 秒采样一帧，**采样时才打开摄像头**；长时间离座自动降频到 10 / 30 分钟一次。平时进程几乎不占 CPU；常驻内存 ~150 MB。
 
 ---
 
 ## 工作原理
 
-每 10 秒抓一帧 → MediaPipe BlazePose 输出 33 个人体关键点 → 几个简单几何指标 → 滑动窗口去抖 → 触发提醒。
+每 10 秒抓一帧 → YOLOv11-pose 先做人物检测，检测到人才输出 17 个 COCO 关键点 → 几个简单几何指标 → 滑动窗口去抖 → 触发提醒。
 
 摄像头**按需开关**：每次抓帧时打开 → 抓一帧 → 立即释放，避免 OpenCV AVFoundation 后台管线持续吃 CPU（这是这类应用最常见的性能陷阱）。代价是摄像头指示灯每 10 秒闪一下（离座 ≥ 5 分钟降到 10 分钟一闪，≥ 30 分钟降到 30 分钟一闪）。
 
 ### 如何判定"有人"
 
-BlazePose 在画面只有椅子时也会给出虚假关键点（典型症状：肩宽接近 0，让后续比值爆到几百几千 → 持续误报"严重低头"）。**有人**判定加了三道闸：
+YOLOv11-pose 是真正的"先检测人 → 再标关键点"两阶段联合模型——画面里没人时模型直接不输出 detection，从根上不会幻觉关键点。person 置信度 < `PERSON_CONF`（默认 0.5）即判定离座。
+
+检测到人之后再加三道次级保险防偶发误检/截断画面：
 
 1. **双肩**关键点都可见
-2. 头部 5 点（鼻 + 双眼 + 双耳）至少 **2 个**可见——椅子上没头
+2. 头部 5 点（鼻 + 双眼 + 双耳）至少 **2 个**可见
 3. 肩宽 ≥ 30 像素，且头肩比落在 `[-2, 2]` 物理合理区间
 
 任一不满足 → 视为离座，本帧丢弃。
+
+> 项目早期用过 MediaPipe BlazePose（lite/heavy），实测在空椅子上仍频繁幻觉出抖动剧烈的"幻觉人"——这是 BlazePose 系架构层面的局限（设计假设是"已知有人，定位关键点"），调阈值挡不住。换 YOLOv11-pose 后这个问题彻底消失。
 
 ### 颈椎前倾如何判定
 
@@ -92,7 +96,19 @@ cd posture-guard
 uv sync   # 或 pip install -r <(uv pip compile pyproject.toml)
 ```
 
-依赖：`mediapipe`、`opencv-python`、`numpy`。模型文件 `pose_landmarker_lite.task`（5.5 MB）首次启动自动下载。
+依赖：`onnxruntime`、`opencv-python`、`numpy`。
+
+## 获取模型
+
+模型文件 `yolo11n-pose.onnx`（~11 MB）需要一次性手动导出。用 `uvx` 临时托管 ultralytics + torch，导出完即可弃用：
+
+```bash
+uvx --with onnx --with onnxslim --from ultralytics yolo export model=yolo11n-pose.pt format=onnx imgsz=640
+```
+
+> `--with onnx --with onnxslim`：ultralytics 导出 ONNX 时需要这两个包，但它的"自动安装"在 uvx 临时环境里不工作（uvx 创建的 venv 默认不带 pip），所以显式声明。
+
+执行完会在当前目录生成 `yolo11n-pose.onnx`。运行时只依赖 `onnxruntime`，**不需要安装 ultralytics 或 torch**。
 
 ## 运行
 
@@ -178,7 +194,7 @@ uv run main.py
 
 - 改善光线（低光下检测置信度差）
 - 摄像头与你保持稳定 70–100 cm 距离
-- 调高 `KP_CONF` 到 `0.6` 过滤更严
+- 调高 `KEYPOINT_CONF` / `PERSON_CONF` 到 `0.6` 过滤更严
 
 ---
 
@@ -201,9 +217,6 @@ uv run main.py
 5. **目前只支持 macOS 通知。**
    Windows / Linux 用户需要把 `notify()` 里的 `osascript` 与 `afplay` 替换为对应系统命令（如 `notify-send` / `paplay`），欢迎 PR。
 
-6. **MediaPipe 内置 Google clearcut 遥测组件。**
-   它每 60 秒尝试上传运行时统计（不含画面或关键点数据）到 Google 服务器，但在没有 API key 的情况下不会真正发送（始终返回 `FAILED_PRECONDITION`）。本项目通过设置 `GLOG_minloglevel=3` 静音相关日志。如果你对此仍有顾虑，可以用防火墙拦截 `clearcut.googleapis.com`，或者改用纯 ONNX Runtime 推理路径。
-
 ---
 
 ## 路线图
@@ -211,7 +224,7 @@ uv run main.py
 - [ ] Linux / Windows 通知后端
 - [ ] 菜单栏小图标（实时显示当前状态，比控制台日志更易用）
 - [ ] 数据落盘统计（每天前倾时长、久坐次数、离座次数）
-- [ ] 可选的 `yolov8n` 物体检测分支，区分"低头玩手机"
+- [ ] 区分"低头玩手机"：在 YOLO 检测里加 `cell phone` 类（COCO 已含 67 类）
 
 ---
 

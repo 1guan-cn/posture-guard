@@ -9,6 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-# Model weights (auto-downloaded on first run)
+# Model weights (导出/下载到本地，不进仓库)
 *.task
 *.pt
+*.onnx
