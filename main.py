@@ -32,9 +32,11 @@ LEAN_RATIO = 0.5     # 低于此 → 轻度低头
 DEEP_RATIO = 0.3     # 低于此 → 严重低头
 EMA_ALPHA = 0.5      # 时序平滑系数（新值权重）
 
-# YOLO 已根治幻觉，下面这些是次级保险（防偶发误检/截断画面）
-MIN_HEAD_POINTS = 2              # 头部 5 点中至少 N 个可见才算人
-MIN_SHOULDER_WIDTH_PX = 30       # 肩宽过窄即噪声
+# YOLO 已根治幻觉，下面这些只用来判断"头肩比能不能算"——算不出就让 head_ratio=None，
+# has_person 仍由 YOLO 的 person_conf 单独决定（避免低头吃东西时头部点 visibility
+# 偏低被误判离座）。
+MIN_HEAD_POINTS = 2              # 头部 5 点中至少 N 个可见才能取头部均值
+MIN_SHOULDER_WIDTH_PX = 30       # 肩宽过窄会让 ratio 数值不稳
 RATIO_VALID_RANGE = (-2.0, 2.0)  # 头肩比物理合理区间
 
 LEAN_WINDOW = 6      # 60 秒（6 帧 × 10 秒）
@@ -113,23 +115,27 @@ def detect_keypoints(session, frame):
 
 # ---------- 单帧分析 ----------
 def analyze_pose(kp):
-    """kp: (17, 3) numpy 数组 [x, y, conf]，None 表示无人。"""
+    """kp: (17, 3) numpy 数组 [x, y, conf]，None 表示 YOLO 没检出人。
+    YOLO 的 person_conf 已经在 detect_keypoints 里挡过阈值，能拿到 kp 就是有人。
+    head_ratio 只在关键点齐全时才算，缺点就让 ratio=None 让 EMA/窗口跳过这一帧
+    （状态机已支持），避免低头吃东西/喝水时被误判离座。"""
     if kp is None:
         return {"has_person": False, "head_ratio": None}
 
     visible = lambda i: kp[i, 2] >= KEYPOINT_CONF
 
+    # 双肩任一不可见 → 算不了肩宽，跳过这一帧的 ratio
     if min(kp[L_SHOULDER, 2], kp[R_SHOULDER, 2]) < KEYPOINT_CONF:
-        return {"has_person": False, "head_ratio": None}
+        return {"has_person": True, "head_ratio": None}
 
     head_visible = [i for i in HEAD_POINTS if visible(i)]
     if len(head_visible) < MIN_HEAD_POINTS:
-        return {"has_person": False, "head_ratio": None}
+        return {"has_person": True, "head_ratio": None}
 
     l_sh, r_sh = kp[L_SHOULDER, :2], kp[R_SHOULDER, :2]
     sh_w = abs(l_sh[0] - r_sh[0])
     if sh_w < MIN_SHOULDER_WIDTH_PX:
-        return {"has_person": False, "head_ratio": None}
+        return {"has_person": True, "head_ratio": None}
 
     sh_mid_y = (l_sh[1] + r_sh[1]) / 2
     head_y = sum(kp[i, 1] for i in head_visible) / len(head_visible)
@@ -137,7 +143,7 @@ def analyze_pose(kp):
     # 头比肩高出多少倍肩宽。端正 ~0.7+，低头减小，趴桌为负
     ratio = (sh_mid_y - head_y) / sh_w
     if not (RATIO_VALID_RANGE[0] <= ratio <= RATIO_VALID_RANGE[1]):
-        return {"has_person": False, "head_ratio": None}
+        return {"has_person": True, "head_ratio": None}
     return {"has_person": True, "head_ratio": float(ratio)}
 
 
